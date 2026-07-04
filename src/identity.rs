@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::{Error, IdentityPaths, npub};
+use crate::{Error, IdentityPaths, npub, nsec};
 
 /// The identity file format version this build reads and writes.
 pub const FORMAT_VERSION: u64 = 1;
@@ -61,6 +61,45 @@ impl std::fmt::Debug for FiniteIdentity {
     }
 }
 
+/// A secret key handed to [`FiniteIdentity::import`]: 32 raw bytes, or a
+/// user-supplied string parsed via [`ImportSecret::parse`].
+///
+/// Deliberately opaque: there is no accessor for the bytes and the [`Debug`]
+/// impl is redacted, so an `ImportSecret` cannot leak through logging.
+pub struct ImportSecret([u8; 32]);
+
+impl ImportSecret {
+    /// Parse a user-supplied secret string.
+    ///
+    /// Accepts NIP-19 `nsec1...` (bech32, HRP `nsec`) or 64 hex chars
+    /// (lowercase or uppercase). Leading/trailing whitespace is trimmed.
+    /// Error messages never echo the input; whether the bytes form a valid
+    /// secp256k1 secret key is checked by [`FiniteIdentity::import`].
+    pub fn parse(s: &str) -> Result<Self, Error> {
+        let s = s.trim();
+        let bytes = if let Some(bytes) = hex::decode32(s) {
+            bytes
+        } else {
+            nsec::decode(s).map_err(|reason| Error::InvalidSecret {
+                reason: format!("expected an nsec1... string or 64 hex chars ({reason})"),
+            })?
+        };
+        Ok(Self(bytes))
+    }
+}
+
+impl From<[u8; 32]> for ImportSecret {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for ImportSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ImportSecret(<redacted>)")
+    }
+}
+
 impl FiniteIdentity {
     /// Load an existing identity. Never mints: if no identity file exists,
     /// returns [`Error::NotFound`].
@@ -99,6 +138,71 @@ impl FiniteIdentity {
         };
         let _ = fs4::fs_std::FileExt::unlock(&lock);
         result
+    }
+
+    /// Adopt an existing secret as the Finite identity and atomically write
+    /// it, following the same locking/write rules as
+    /// [`load_or_generate`](Self::load_or_generate).
+    ///
+    /// Refuses to overwrite: if an identity file already exists (even one
+    /// this build cannot parse), returns [`Error::AlreadyExists`] and leaves
+    /// the file untouched. Racing `import` against `load_or_generate` has
+    /// exactly one winner under the shared lock: if generation wins, `import`
+    /// fails with `AlreadyExists`; if `import` wins, `load_or_generate`
+    /// adopts the imported key.
+    ///
+    /// The public key is derived from the secret and stored; `created_by`
+    /// names the importing tool and `created_at` records the import time.
+    /// Returns [`Error::InvalidSecret`] if the bytes are not a valid
+    /// secp256k1 secret key.
+    pub fn import(
+        paths: &IdentityPaths,
+        secret: ImportSecret,
+        created_by: &str,
+    ) -> Result<Self, Error> {
+        ensure_secure_platform()?;
+        create_identity_root(paths.root())?;
+
+        let lock_path = paths.lock_file();
+        let lock = open_lock_file(&lock_path)?;
+        fs4::fs_std::FileExt::lock_exclusive(&lock).map_err(|error| io_error(&lock_path, error))?;
+        let result = Self::import_locked(paths, secret, created_by);
+        let _ = fs4::fs_std::FileExt::unlock(&lock);
+        result
+    }
+
+    /// Check-and-write half of [`import`](Self::import). Caller must hold
+    /// the exclusive lock.
+    fn import_locked(
+        paths: &IdentityPaths,
+        secret: ImportSecret,
+        created_by: &str,
+    ) -> Result<Self, Error> {
+        let dest = paths.identity_file();
+        match fs::symlink_metadata(&dest) {
+            Ok(_) => return Err(Error::AlreadyExists { path: dest }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&dest, error)),
+        }
+
+        let secret_key = SecretKey::from_slice(&secret.0).map_err(|_| Error::InvalidSecret {
+            reason: "not a valid secp256k1 secret key".to_owned(),
+        })?;
+        let keypair = Keypair::from_secret_key(SECP256K1, &secret_key);
+        let public_key_hex = hex::encode(&keypair.x_only_public_key().0.serialize());
+        let created_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("UTC datetime always formats as RFC3339");
+
+        let identity = Self {
+            keypair,
+            public_key_hex,
+            created_at,
+            created_by: created_by.to_owned(),
+            extra: Map::new(),
+        };
+        identity.write_atomic(paths)?;
+        Ok(identity)
     }
 
     /// Mint a fresh identity and atomically write it. Caller must hold the
@@ -393,6 +497,28 @@ mod tests {
         assert_eq!(rewritten["another"], "kept");
         assert_eq!(rewritten["secret_hex"], secret_hex);
         assert_eq!(rewritten["version"], 1);
+    }
+
+    // Neither FiniteIdentity nor ImportSecret may leak key material through
+    // their Debug impls.
+    #[test]
+    fn debug_impls_are_redacted() {
+        let secret_hex = "0000000000000000000000000000000000000000000000000000000000000003";
+        let secret = ImportSecret::parse(secret_hex).unwrap();
+        assert_eq!(format!("{secret:?}"), "ImportSecret(<redacted>)");
+
+        let key = SecretKey::from_slice(&hex::decode32(secret_hex).unwrap()).unwrap();
+        let identity = FiniteIdentity {
+            keypair: Keypair::from_secret_key(SECP256K1, &key),
+            public_key_hex: "irrelevant".to_owned(),
+            created_at: "2026-07-04T00:00:00Z".to_owned(),
+            created_by: "test/0.0.0".to_owned(),
+            extra: Map::new(),
+        };
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains(secret_hex), "Debug must not leak secret");
+        let nsec = crate::nsec::encode(&key.secret_bytes());
+        assert!(!debug.contains(&nsec), "Debug must not leak secret");
     }
 
     #[test]

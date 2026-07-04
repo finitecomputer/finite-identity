@@ -5,7 +5,7 @@
 use std::fs;
 use std::sync::Arc;
 
-use finite_identity::{Error, FiniteIdentity, IdentityPaths};
+use finite_identity::{Error, FiniteIdentity, IdentityPaths, ImportSecret};
 
 fn temp_paths() -> (tempfile::TempDir, IdentityPaths) {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -74,6 +74,211 @@ fn concurrent_load_or_generate_converges_on_one_key() {
         .filter(|name| name != "identity.json" && name != ".lock")
         .collect();
     assert!(leftovers.is_empty(), "unexpected files: {leftovers:?}");
+}
+
+#[test]
+fn import_hex_and_nsec_inputs_produce_the_same_identity() {
+    let mut secret_bytes = [0u8; 32];
+    secret_bytes[31] = 3;
+    let nsec = finite_identity::nsec::encode(&secret_bytes);
+
+    let inputs = [
+        SECRET_HEX.to_owned(),
+        SECRET_HEX.to_uppercase(),
+        nsec,
+        format!("  {SECRET_HEX}\n"), // stdin input keeps its trailing newline
+    ];
+    let mut npubs = Vec::new();
+    for input in &inputs {
+        let (_dir, paths) = temp_paths();
+        let secret = ImportSecret::parse(input).expect("parse");
+        let imported = FiniteIdentity::import(&paths, secret, "test-tool/1.0.0").expect("import");
+        assert_eq!(imported.public_key_hex(), PUBLIC_HEX);
+        assert_eq!(imported.expose_secret_bytes(), secret_bytes);
+        assert_eq!(imported.created_by(), "test-tool/1.0.0");
+        npubs.push(imported.npub());
+    }
+    assert!(npubs.iter().all(|n| n == &npubs[0]));
+
+    // Raw bytes are accepted directly via From<[u8; 32]>.
+    let (_dir, paths) = temp_paths();
+    let imported =
+        FiniteIdentity::import(&paths, secret_bytes.into(), "test-tool/1.0.0").expect("import");
+    assert_eq!(imported.npub(), npubs[0]);
+}
+
+#[test]
+fn import_then_load_round_trips() {
+    let (_dir, paths) = temp_paths();
+    let secret = ImportSecret::parse(SECRET_HEX).unwrap();
+    let imported = FiniteIdentity::import(&paths, secret, "importer/1.0.0").expect("import");
+
+    let loaded = FiniteIdentity::load(&paths).expect("load");
+    assert_eq!(loaded.public_key_hex(), imported.public_key_hex());
+    assert_eq!(loaded.created_by(), "importer/1.0.0");
+    assert_eq!(loaded.created_at(), imported.created_at());
+
+    // load_or_generate adopts the imported identity, never re-mints.
+    let adopted = FiniteIdentity::load_or_generate(&paths, "other/2.0.0").expect("adopt");
+    assert_eq!(adopted.public_key_hex(), imported.public_key_hex());
+    assert_eq!(adopted.created_by(), "importer/1.0.0");
+}
+
+#[test]
+fn import_refuses_to_overwrite_and_leaves_file_untouched() {
+    let (_dir, paths) = temp_paths();
+    let minted = FiniteIdentity::load_or_generate(&paths, "first/1.0.0").expect("mint");
+    let before = fs::read_to_string(paths.identity_file()).unwrap();
+
+    let secret = ImportSecret::parse(SECRET_HEX).unwrap();
+    match FiniteIdentity::import(&paths, secret, "importer/1.0.0") {
+        Err(Error::AlreadyExists { path }) => assert_eq!(path, paths.identity_file()),
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(paths.identity_file()).unwrap(),
+        before,
+        "existing identity file must be left untouched"
+    );
+    let loaded = FiniteIdentity::load(&paths).unwrap();
+    assert_eq!(loaded.public_key_hex(), minted.public_key_hex());
+}
+
+#[test]
+fn import_secret_parse_rejects_bad_input() {
+    // Wrong bech32 hrp: an npub (public key) is never a secret.
+    let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+    assert!(matches!(
+        ImportSecret::parse(npub),
+        Err(Error::InvalidSecret { .. })
+    ));
+    // Wrong hex length.
+    assert!(matches!(
+        ImportSecret::parse(&SECRET_HEX[..63]),
+        Err(Error::InvalidSecret { .. })
+    ));
+    assert!(matches!(
+        ImportSecret::parse(&format!("{SECRET_HEX}00")),
+        Err(Error::InvalidSecret { .. })
+    ));
+    // Mixed garbage, and garbage that never echoes back in the error.
+    for garbage in [
+        "",
+        "hello world",
+        "nsec1zzzz",
+        "0xdeadbeef",
+        "g".repeat(64).as_str(),
+    ] {
+        match ImportSecret::parse(garbage) {
+            Err(Error::InvalidSecret { reason }) => {
+                if !garbage.is_empty() {
+                    assert!(
+                        !reason.contains(garbage),
+                        "error must not echo the input: {reason}"
+                    );
+                }
+            }
+            other => panic!("expected InvalidSecret for {garbage:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn import_rejects_invalid_secp256k1_scalar() {
+    // All-zero bytes parse as hex but are not a valid secret key; the check
+    // happens at import time and nothing is written.
+    let (_dir, paths) = temp_paths();
+    let zeros = ImportSecret::parse(&"0".repeat(64)).expect("parse accepts 64 hex chars");
+    match FiniteIdentity::import(&paths, zeros, "test/0.0.0") {
+        Err(Error::InvalidSecret { .. }) => {}
+        other => panic!("expected InvalidSecret, got {other:?}"),
+    }
+    assert!(!paths.identity_file().exists());
+}
+
+// Racing import against load_or_generate must have exactly one winner under
+// the shared lock: if generation wins, import fails with AlreadyExists; if
+// import wins, load_or_generate adopts the imported key.
+#[test]
+fn concurrent_import_and_load_or_generate_have_one_winner() {
+    let (_dir, paths) = temp_paths();
+    let paths = Arc::new(paths);
+
+    let importers: Vec<_> = (0..8)
+        .map(|i| {
+            let paths = Arc::clone(&paths);
+            std::thread::spawn(move || {
+                let secret = ImportSecret::parse(SECRET_HEX).unwrap();
+                FiniteIdentity::import(&paths, secret, &format!("importer/{i}"))
+                    .map(|id| id.public_key_hex().to_owned())
+            })
+        })
+        .collect();
+    let generators: Vec<_> = (0..8)
+        .map(|i| {
+            let paths = Arc::clone(&paths);
+            std::thread::spawn(move || {
+                FiniteIdentity::load_or_generate(&paths, &format!("racer/{i}"))
+                    .expect("load_or_generate never fails in this race")
+                    .public_key_hex()
+                    .to_owned()
+            })
+        })
+        .collect();
+
+    let import_results: Vec<_> = importers.into_iter().map(|h| h.join().unwrap()).collect();
+    let generated_keys: Vec<_> = generators.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let final_key = FiniteIdentity::load(&paths)
+        .unwrap()
+        .public_key_hex()
+        .to_owned();
+    // Every load_or_generate converged on the single on-disk key.
+    assert!(generated_keys.iter().all(|k| k == &final_key));
+
+    let mut winners = 0;
+    for result in &import_results {
+        match result {
+            Ok(key) => {
+                winners += 1;
+                assert_eq!(key, &final_key, "a winning import defines the key");
+                assert_eq!(key, PUBLIC_HEX);
+            }
+            Err(Error::AlreadyExists { .. }) => {}
+            Err(other) => panic!("expected Ok or AlreadyExists, got {other:?}"),
+        }
+    }
+    assert!(winners <= 1, "at most one import can win");
+    if final_key == PUBLIC_HEX {
+        assert_eq!(winners, 1, "if the imported key is on disk, an import won");
+    }
+
+    // Exactly one identity file, no leftover temp files.
+    let leftovers: Vec<_> = fs::read_dir(paths.root())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != "identity.json" && name != ".lock")
+        .collect();
+    assert!(leftovers.is_empty(), "unexpected files: {leftovers:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn imported_file_permissions_are_restrictive() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, paths) = temp_paths();
+    let secret = ImportSecret::parse(SECRET_HEX).unwrap();
+    FiniteIdentity::import(&paths, secret, "test/0.0.0").unwrap();
+
+    let dir_mode = fs::metadata(paths.root()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700, "identity root must be 0700");
+    let file_mode = fs::metadata(paths.identity_file())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600, "imported identity.json must be 0600");
 }
 
 fn write_identity_file(paths: &IdentityPaths, contents: &str) {

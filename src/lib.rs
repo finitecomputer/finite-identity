@@ -20,8 +20,11 @@
 mod error;
 mod identity;
 pub mod npub;
+pub mod nsec;
 mod paths;
 
 pub use error::Error;
-pub use identity::{ALLOW_INSECURE_ENV, FORMAT_VERSION, FiniteIdentity, KIND_NOSTR_SECP256K1};
+pub use identity::{
+    ALLOW_INSECURE_ENV, FORMAT_VERSION, FiniteIdentity, ImportSecret, KIND_NOSTR_SECP256K1,
+};
 pub use paths::{FINITE_HOME_ENV, IDENTITY_FILE_NAME, IdentityPaths, LOCK_FILE_NAME};

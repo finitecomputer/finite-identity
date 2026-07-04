@@ -69,6 +69,23 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// An identity file already exists.
+    /// [`FiniteIdentity::import`](crate::FiniteIdentity::import) refuses to
+    /// overwrite it; the existing file is left untouched.
+    #[error("an identity already exists at {path}; refusing to overwrite it")]
+    AlreadyExists {
+        /// The existing identity file path.
+        path: PathBuf,
+    },
+
+    /// A supplied secret could not be parsed or is not a valid secp256k1
+    /// secret key. The message never echoes the input.
+    #[error("invalid secret: {reason}")]
+    InvalidSecret {
+        /// Why the secret was rejected (never contains the input).
+        reason: String,
+    },
+
     /// On non-Unix platforms, secret storage cannot be permission-protected.
     /// Set `FINITE_IDENTITY_ALLOW_INSECURE=1` to proceed anyway.
     #[error(
