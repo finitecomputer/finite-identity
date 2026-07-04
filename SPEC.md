@@ -51,7 +51,7 @@ Rules:
   "secret_hex": "<64 lowercase hex chars>",
   "public_key_hex": "<64 lowercase hex chars, x-only>",
   "created_at": "<RFC3339>",
-  "created_by": "<tool name/version that minted it>"
+  "created_by": "<tool name/version that minted or imported it>"
 }
 ```
 
@@ -69,6 +69,20 @@ Writers take an exclusive advisory lock on `<identity-root>/.lock` around the
 check-and-mint, write to a temp file in the same directory, fsync, and rename
 into place. Readers that find no file may mint (same lock) via
 `load_or_generate`; `load` never mints.
+
+## Import (still contract v1)
+
+The identity file may be created by `FiniteIdentity::import` (adopting a
+user-supplied secret, e.g. an existing Nostr key) as well as by
+`load_or_generate`. Import writes the same v1 format under the same lock and
+atomic-write rules, and records `created_by`/`created_at` for the importing
+tool exactly like minting does. Import REFUSES to overwrite an existing
+identity file — even one this build cannot parse — with a distinct
+`AlreadyExists` error. Racing `import` against `load_or_generate` therefore
+has exactly one winner: if generation takes the lock first, import fails
+with `AlreadyExists`; if import wins, `load_or_generate` adopts the imported
+key. CLI-facing conventions for import live in
+[CLI-CONVENTIONS.md](./CLI-CONVENTIONS.md).
 
 ## Runtime behavior
 
