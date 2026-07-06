@@ -605,6 +605,15 @@ async fn product_cli_client_helpers_sign_vip_and_email_only_flows() {
 #[tokio::test]
 async fn operator_can_inspect_and_disable_vip_binding_without_reassignment() {
     let (app, store, _mailer, _clock) = fixture();
+    let (status, _challenge) = json_request(
+        app.clone(),
+        "POST",
+        "/api/v1/email-challenges",
+        serde_json::json!({ "email": ALICE_EMAIL }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     store
         .bind_vip_email(ALICE_EMAIL, ALICE_PUBKEY, NOW)
         .expect("persist binding");
@@ -624,6 +633,16 @@ async fn operator_can_inspect_and_disable_vip_binding_without_reassignment() {
     assert_eq!(inspected["pubkey"], ALICE_PUBKEY);
     assert_eq!(inspected["disabled"], false);
     assert_eq!(inspected["nip05"], ALICE_EMAIL);
+    assert_eq!(inspected["principal_link"]["email"], ALICE_EMAIL);
+    assert_eq!(inspected["principal_link"]["pubkey"], ALICE_PUBKEY);
+    assert_eq!(inspected["principal_link"]["verified_at"], NOW);
+    assert_eq!(inspected["email_challenges"][0]["email"], ALICE_EMAIL);
+    assert_eq!(inspected["email_challenges"][0]["created_at"], NOW);
+    assert_eq!(inspected["email_challenges"][0]["expires_at"], NOW + 600);
+    assert_eq!(
+        inspected["email_challenges"][0]["used_at"],
+        serde_json::Value::Null
+    );
 
     let (status, disabled) = json_request_with_headers(
         app.clone(),
@@ -673,6 +692,8 @@ async fn operator_can_inspect_and_disable_vip_binding_without_reassignment() {
     assert_eq!(inspected["pubkey"], ALICE_PUBKEY);
     assert_eq!(inspected["vip_emails"][0]["email"], ALICE_EMAIL);
     assert_eq!(inspected["vip_emails"][0]["disabled"], true);
+    assert_eq!(inspected["principal_links"][0]["email"], ALICE_EMAIL);
+    assert_eq!(inspected["principal_links"][0]["pubkey"], ALICE_PUBKEY);
 }
 
 #[tokio::test]

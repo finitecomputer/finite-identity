@@ -427,6 +427,59 @@ impl IdentityStore {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
+
+    fn principal_link_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<PrincipalLinkRecord>, StoreError> {
+        self.conn
+            .lock()
+            .expect("store mutex never poisoned")
+            .query_row(
+                "SELECT email, pubkey, verified_at, revoked_at
+                 FROM principal_links
+                 WHERE email = ?1",
+                params![email],
+                PrincipalLinkRecord::from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn principal_links_by_pubkey(
+        &self,
+        pubkey: &str,
+    ) -> Result<Vec<PrincipalLinkRecord>, StoreError> {
+        let conn = self.conn.lock().expect("store mutex never poisoned");
+        let mut statement = conn.prepare(
+            "SELECT email, pubkey, verified_at, revoked_at
+             FROM principal_links
+             WHERE pubkey = ?1
+             ORDER BY email",
+        )?;
+        let records = statement
+            .query_map(params![pubkey], PrincipalLinkRecord::from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    fn email_challenge_audits_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Vec<EmailChallengeAuditRecord>, StoreError> {
+        let conn = self.conn.lock().expect("store mutex never poisoned");
+        let mut statement = conn.prepare(
+            "SELECT email, expires_at, used_at, created_at
+             FROM email_challenges
+             WHERE email = ?1
+             ORDER BY created_at DESC
+             LIMIT 20",
+        )?;
+        let records = statement
+            .query_map(params![email], EmailChallengeAuditRecord::from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -471,6 +524,44 @@ impl EmailOnlyPrincipalRecord {
             pubkey: row.get(1)?,
             verified_at: row.get(2)?,
             revoked_at: row.get(3)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PrincipalLinkRecord {
+    email: String,
+    pubkey: String,
+    verified_at: u64,
+    revoked_at: Option<u64>,
+}
+
+impl PrincipalLinkRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            email: row.get(0)?,
+            pubkey: row.get(1)?,
+            verified_at: row.get(2)?,
+            revoked_at: row.get(3)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EmailChallengeAuditRecord {
+    email: String,
+    expires_at: u64,
+    used_at: Option<u64>,
+    created_at: u64,
+}
+
+impl EmailChallengeAuditRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            email: row.get(0)?,
+            expires_at: row.get(1)?,
+            used_at: row.get(2)?,
+            created_at: row.get(3)?,
         })
     }
 }
@@ -692,6 +783,12 @@ async fn operator_inspect(
         } else {
             email.email
         };
+        let email_challenges = match state.store.email_challenge_audits_by_email(&normalized) {
+            Ok(records) => records,
+            Err(error) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, store_error_code(&error));
+            }
+        };
         if let Some(binding) = match state.store.vip_binding_by_email(&normalized) {
             Ok(binding) => binding,
             Err(error) => {
@@ -703,6 +800,12 @@ async fn operator_inspect(
             } else {
                 serde_json::Value::String(binding.email.clone())
             };
+            let principal_link = match state.store.principal_link_by_email(&normalized) {
+                Ok(link) => link,
+                Err(error) => {
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, store_error_code(&error));
+                }
+            };
             return Json(serde_json::json!({
                 "kind": "vip_email",
                 "email": binding.email,
@@ -713,6 +816,8 @@ async fn operator_inspect(
                 "disabled": binding.disabled(),
                 "disabled_at": binding.disabled_at,
                 "nip05": nip05,
+                "principal_link": principal_link,
+                "email_challenges": email_challenges,
             }))
             .into_response();
         }
@@ -729,6 +834,7 @@ async fn operator_inspect(
             "kind": "email_only",
             "email": normalized,
             "principals": email_only,
+            "email_challenges": email_challenges,
         }))
         .into_response();
     }
@@ -752,6 +858,12 @@ async fn operator_inspect(
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, store_error_code(&error));
         }
     };
+    let principal_links = match state.store.principal_links_by_pubkey(&pubkey) {
+        Ok(records) => records,
+        Err(error) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, store_error_code(&error));
+        }
+    };
     if vip_emails.is_empty() && email_only_emails.is_empty() {
         return api_error(StatusCode::NOT_FOUND, "principal_not_found");
     }
@@ -770,6 +882,7 @@ async fn operator_inspect(
             }))
             .collect::<Vec<_>>(),
         "email_only_emails": email_only_emails,
+        "principal_links": principal_links,
     }))
     .into_response()
 }
