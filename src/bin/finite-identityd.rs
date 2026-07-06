@@ -30,6 +30,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
     }
     let finite_vip_domain =
         flag_value(&args, "--finite-vip-domain").unwrap_or_else(|| "finite.vip".to_owned());
+    let operator_token = flag_value(&args, "--operator-token");
     let address: SocketAddr = listen
         .parse()
         .map_err(|error| format!("invalid --listen address: {error}"))?;
@@ -44,6 +45,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             external_base_url,
             finite_vip_domain,
             email_challenge_ttl_seconds: 15 * 60,
+            operator_token,
         },
     );
     let listener = tokio::net::TcpListener::bind(address)
@@ -60,5 +62,5 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
 }
 
 fn usage() -> String {
-    "usage: finite-identityd serve --data DIR --external-base-url URL --dev-print-email-tokens yes [--listen 127.0.0.1:8790] [--finite-vip-domain finite.vip]".to_owned()
+    "usage: finite-identityd serve --data DIR --external-base-url URL --dev-print-email-tokens yes [--listen 127.0.0.1:8790] [--finite-vip-domain finite.vip] [--operator-token TOKEN]".to_owned()
 }

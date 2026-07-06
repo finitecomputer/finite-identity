@@ -18,6 +18,7 @@
 //! ```
 
 pub mod authority;
+pub mod client;
 mod error;
 pub mod hex;
 mod identity;
