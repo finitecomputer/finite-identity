@@ -49,7 +49,8 @@ finite-identityd serve \
   --finite-vip-domain finite.vip \
   --listen 127.0.0.1:8790 \
   --operator-token "$FINITE_IDENTITY_OPERATOR_TOKEN" \
-  --dev-print-email-tokens yes
+  --mailer resend \
+  --mail-from "Finite Identity <identity@finite.chat>"
 ```
 
 Runtime flags:
@@ -61,13 +62,28 @@ Runtime flags:
 | `--finite-vip-domain DOMAIN` | Finite VIP Domain. Defaults to `finite.vip`. |
 | `--listen HOST:PORT` | Local bind address. Defaults to `127.0.0.1:8790`. |
 | `--operator-token TOKEN` | Enables v1 operator endpoints. If omitted, operator endpoints reject every request. |
-| `--dev-print-email-tokens yes` | Development-only guard that enables the built-in `DevMailer`, which prints Email Challenge tokens to stderr. |
+| `--mailer dev` | Development mailer. Requires `--dev-print-email-tokens yes` so token printing is explicit. |
+| `--mailer resend` | Production mailer using the Resend JSON API. Requires `--mail-from ADDR` and `RESEND_API_KEY`. |
+| `--mailer postmark` | Production mailer using the Postmark JSON API. Requires `--mail-from ADDR` and `POSTMARK_SERVER_TOKEN`. |
+| `--mail-from ADDR` | Sender shown on production Email Challenge messages. Never put provider API keys in argv. |
+| `--dev-print-email-tokens yes` | Development-only guard that enables token printing when `--mailer dev` is selected. |
 
-The current binary wires the development Mailer Adapter. A production deploy
-must replace that runtime wiring with a production `Mailer` implementation
-such as Resend, Postmark, or SMTP before sending real user challenges. The
-identity semantics stay the same: token creation, hashing, expiry, redemption,
-and replay rejection remain inside Finite Identity; only delivery changes.
+Production deploys should keep provider API keys in the service environment,
+not argv. The identity semantics stay the same across mailers: token creation,
+hashing, expiry, redemption, and replay rejection remain inside Finite
+Identity; only delivery changes.
+
+For local development, make the token-printer explicit:
+
+```sh
+finite-identityd serve \
+  --data ./.dev/finite-identity \
+  --external-base-url http://127.0.0.1:8790 \
+  --listen 127.0.0.1:8790 \
+  --operator-token dev-operator-token \
+  --mailer dev \
+  --dev-print-email-tokens yes
+```
 
 ## HTTP Contract
 
