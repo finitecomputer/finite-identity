@@ -17,8 +17,11 @@
 //! # Ok::<(), finite_identity::Error>(())
 //! ```
 
+pub mod authority;
 mod error;
+pub mod hex;
 mod identity;
+pub mod nip98;
 pub mod npub;
 pub mod nsec;
 mod paths;
