@@ -81,9 +81,22 @@ finite-identityd serve \
 
 The `--dev-print-email-tokens yes` flag intentionally gates the built-in
 development mailer, which prints challenge tokens to stderr. Production
-deployments must wire a production Mailer Adapter while keeping challenge
-creation, hashing, expiry, redemption, and replay rejection inside Finite
-Identity.
+deployments should select a real Mailer Adapter instead:
+
+```sh
+RESEND_API_KEY=re_xxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+finite-identityd serve \
+  --data /var/lib/finite-identity \
+  --external-base-url https://identity.finite.vip \
+  --listen 127.0.0.1:8790 \
+  --operator-token "$FINITE_IDENTITY_OPERATOR_TOKEN" \
+  --mailer resend \
+  --mail-from "Finite Identity <identity@finite.chat>"
+```
+
+Postmark is also supported with `--mailer postmark` and
+`POSTMARK_SERVER_TOKEN`. Challenge creation, hashing, expiry, redemption, and
+replay rejection remain inside Finite Identity; only delivery changes.
 
 The service exposes:
 
